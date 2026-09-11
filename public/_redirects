@@ -83,6 +83,3 @@
 /posts/seo-JSON_LD/  /posts/seo-json_ld/  301
 /posts/seo-TDK/  /posts/seo-tdk/  301
 /posts/vue3-Guides/  /posts/vue3-guides/  301
-# 仅裸域 choria.top → www（避免 www 自身陷入重定向环）
-Host: choria.top
-/  https://www.choria.top/  301
