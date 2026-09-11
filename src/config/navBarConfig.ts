@@ -40,6 +40,12 @@ export const LinkPresets: Record<string, NavBarLink> = {
 		icon: "material-symbols:handshake-outline-rounded",
 		pageKey: "friends",
 	},
+	Moments: {
+		name: i18n(I18nKey.moments),
+		url: "/moments/",
+		icon: "material-symbols:auto-awesome-outline-rounded",
+		pageKey: "moments",
+	},
 	Anime: {
 		name: i18n(I18nKey.anime),
 		url: "/anime/",

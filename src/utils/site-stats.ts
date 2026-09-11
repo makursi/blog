@@ -6,12 +6,14 @@
 import { render } from "astro:content";
 import {
 	getCategoryList,
+	getSortedMoments,
 	getSortedPosts,
 	getTagList,
 } from "./content-utils";
 
 export interface SiteStats {
 	posts: number;
+	moments: number;
 	categories: number;
 	tags: number;
 	/** 全部文章 remark 字数之和 */
@@ -29,8 +31,9 @@ let cache: SiteStats | null = null;
 export async function getSiteStats(): Promise<SiteStats> {
 	if (cache) return cache;
 
-	const [posts, categories, tags] = await Promise.all([
+	const [posts, moments, categories, tags] = await Promise.all([
 		getSortedPosts(),
+		getSortedMoments(),
 		getCategoryList(),
 		getTagList(),
 	]);
@@ -52,6 +55,7 @@ export async function getSiteStats(): Promise<SiteStats> {
 
 	cache = {
 		posts: posts.length,
+		moments: moments.length,
 		categories: categories.length,
 		tags: tags.length,
 		words,
