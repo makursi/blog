@@ -69,3 +69,11 @@ artifacts/lighthouse/*
 
 # generated AI skills plugin packages
 artifacts/shirone-ai-*
+
+# content:sync 物化输出（内容归内容仓库所有，fork 不跟踪）
+src/content/
+src/data/
+src/user/
+src/assets/images/
+public/images/
+public/assets/
