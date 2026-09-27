@@ -73,6 +73,24 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # ── fork 本地补丁（ADR-0004）：取回上游 demo 内容，让上游原版的校验在本仓能跑 ──
+      # 内容分离后本仓新克隆里没有「物化路径」（.gitignore:77-78 等），而主题源码对其中一部分是
+      # **静态 import**（`src/data/*.ts`、`src/user/user-config.ts`）⇒ 上游原版的 astro check / pnpm build
+      # 在本仓**必挂**（§M3 实测：`Could not resolve "../user/user-config.ts"`）。
+      # 这里从 upstream 取回 **demo 内容**兜底：CI 只验代码，不需要、也不应该碰私密内容仓
+      # （所以**不**配 CONTENT_REPO_URL）。若上游新增了别的物化路径而此处漏列，下面的 `test -f` 会
+      # **大声**失败而不是静默放过。
+      - name: Materialize upstream demo content
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/LyraVoid/Shirone.git 2>/dev/null || true
+          git fetch --depth=1 upstream main
+          git checkout upstream/main -- \
+            src/content src/data src/user src/assets/images \
+            public/images public/assets src/config/FooterConfig.html
+          test -f src/user/user-config.ts
+          echo "restored $(git diff --cached --name-only | wc -l) demo files from upstream/main"
+
       - name: Check Astro diagnostics
         run: pnpm exec astro check
 
@@ -112,6 +130,18 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # 同 checks job：先取回上游 demo 内容，否则 `pnpm build` 在本仓必挂（§M3 / ADR-0004）。
+      - name: Materialize upstream demo content
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/LyraVoid/Shirone.git 2>/dev/null || true
+          git fetch --depth=1 upstream main
+          git checkout upstream/main -- \
+            src/content src/data src/user src/assets/images \
+            public/images public/assets src/config/FooterConfig.html
+          test -f src/user/user-config.ts
+          echo "restored $(git diff --cached --name-only | wc -l) demo files from upstream/main"
 
       - name: Build production site
         run: pnpm build
