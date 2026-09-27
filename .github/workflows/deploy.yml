@@ -1,9 +1,11 @@
 # 发布链迁移（官方主路径 · 变体 E：Actions 构建 + wrangler 直传）—— 阶段 1：影子构建
 #
 # 现状分阶段（本文件一次只加一步，每步可停）：
-#   阶段 1（本文件当前形态）：只构建 + 上传 artifact 供与 Cloudflare 侧产物对账，**不含任何部署步骤**。
-#   阶段 2：末尾加 `wrangler pages deploy dist --project-name=shirone --branch=<preview 分支>`，
-#           落成 preview 部署，用来验 `_redirects` / `_headers` 在直传模式下生效。
+#   阶段 1（已完成，2026-09-27）：只构建 + 上传 artifact 供与 Cloudflare 侧产物对账，**不含任何部署步骤**。
+#           实测：job 2m27s；与 CF 同内容 commit（396d3d3）逐项一致——160 pages / pagefind 126 页 2 语言 /
+#           179 icons / 字体 4 个 643.3 KB / 物化 245 files。
+#   阶段 2（本文件当前形态）：末尾加 preview 直传（`--branch=variant-e-test`，**不打生产**），
+#           用来验 `_redirects` 在直传模式下真的生效（本项目没有 public/_headers，那项不作判据）。
 #   阶段 3：`--branch=main` 生产直传 + 内容仓改用 repository_dispatch 触发，
 #           并在 CF 侧关掉 Branch control 的自动生产构建（顺序：先关平台、再启直传）。
 #
@@ -147,7 +149,7 @@ jobs:
             for p in index.html 404.html sitemap-0.xml rss.xml posts/mattpocock-workflow/index.html; do
               if [ -f "dist/$p" ]; then echo "- ✓ /$p"; else echo "- ✗ /$p（缺失）"; fi
             done
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dist artifact (compare only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -157,3 +159,24 @@ jobs:
           path: dist
           retention-days: 1
           if-no-files-found: error
+
+      # ── 阶段 2：preview 直传（**不打生产**）──────────────────────────────────────
+      # 分支名取非 main → Cloudflare 落成 preview 部署，URL 形如
+      #   https://variant-e-test.shirone-5a9.pages.dev
+      # 阶段 3 才改成 --branch=main（生产），且必须「先关 CF 自动生产构建、再启直传」，
+      # 否则一次 push 会触发两次上线。
+      # 直传是官方《Use Direct Upload with continuous integration》那套做法：
+      #   Account API Token 需 Cloudflare Pages: Edit，配合 CLOUDFLARE_ACCOUNT_ID 使用。
+      # --commit-dirty=true：content:sync 会往工作区写物化文件，仓库必然是 dirty 的（预期行为）。
+      - name: Deploy preview to Cloudflare Pages (direct upload)
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # 钉死版本，与 pnpm 9.14.4 / Node 22 同一策略，避免 npx 漂移。
+          WRANGLER_VERSION: 4.141.0
+        run: |
+          set -euo pipefail
+          npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy dist \
+            --project-name=shirone \
+            --branch=variant-e-test \
+            --commit-dirty=true
