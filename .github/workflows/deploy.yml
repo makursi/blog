@@ -1,0 +1,159 @@
+# 发布链迁移（官方主路径 · 变体 E：Actions 构建 + wrangler 直传）—— 阶段 1：影子构建
+#
+# 现状分阶段（本文件一次只加一步，每步可停）：
+#   阶段 1（本文件当前形态）：只构建 + 上传 artifact 供与 Cloudflare 侧产物对账，**不含任何部署步骤**。
+#   阶段 2：末尾加 `wrangler pages deploy dist --project-name=shirone --branch=<preview 分支>`，
+#           落成 preview 部署，用来验 `_redirects` / `_headers` 在直传模式下生效。
+#   阶段 3：`--branch=main` 生产直传 + 内容仓改用 repository_dispatch 触发，
+#           并在 CF 侧关掉 Branch control 的自动生产构建（顺序：先关平台、再启直传）。
+#
+# 为什么放代码仓：官方 docs/content-separation/dual-repo-ci.md 的主路径就是
+# 「内容仓 push → 派发信号 → 代码仓 Actions 拉内容 → content:sync → pnpm build → 交付平台」，
+# 本文件即该 deploy.yml（模板见 .github/workflows/deploy.yml.example），
+# 交付步用变体 E（本仓自定，官方模板只给了 A Vercel / B GH Pages / C rsync / D 平台 hook）。
+# 属 ADR-0004 允许的「发布链 / CI 面 fork 本地补丁」。
+#
+# ⚠️ 本仓是**公开仓**：Actions 日志与 artifact 任何人可读。
+#   - artifact 只传 dist/（= 已发布的公开站点内容），**绝不**传 .content-src/ 或 src/content/（那是内容仓原始副本，含草稿）；
+#   - 不要给构建步骤加 --verbose；内容类报错先在内容仓本地跑 `pnpm content:validate` 确认。
+name: Deploy
+
+on:
+  # 阶段 1 只用手动触发：避免每次代码 push 都跑一遍（阶段 3 再加 repository_dispatch）。
+  workflow_dispatch:
+    inputs:
+      content_ref:
+        description: "内容仓 ref 或 commit SHA（留空使用 main）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# 与官方模板一致：代码仓 push 与内容仓触发归入同一并发通道，后发的取消在跑的。
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+env:
+  CONTENT_REPOSITORY: makursi/blog-content
+  CONTENT_WORKING_COPY: .content-src
+
+jobs:
+  build:
+    name: Shadow build (no deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI: true
+      # 让 content:sync 走「本地目录」模式，内容由下面的 checkout 步骤取得（与官方模板相同）。
+      CONTENT_DIR: .content-src
+
+    steps:
+      - name: Resolve content ref
+        id: target
+        # 经 env 传递而不直接内插：client_payload / inputs 属外部输入，内插会形成 shell 注入面。
+        env:
+          INPUT_REF: ${{ github.event.inputs.content_ref }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-}"
+          [ -n "$ref" ] || ref="main"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout theme
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Checkout content
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.CONTENT_REPOSITORY }}
+          ref: ${{ steps.target.outputs.ref }}
+          path: ${{ env.CONTENT_WORKING_COPY }}
+          token: ${{ secrets.CONTENT_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Record content commit
+        id: content
+        run: |
+          set -euo pipefail
+          echo "sha=$(git -C '${{ env.CONTENT_WORKING_COPY }}' rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 9.14.4
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4.3.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Restore build caches
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # 缩略图按源图内容哈希复用（跨 commit 命中安全）；内容层存储不跨 commit 缓存。
+          path: |
+            public/assets/moments/thumbnails
+          key: ${{ runner.os }}-shirone-thumbnails-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-shirone-thumbnails-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      # 独立成步（官方模板同款）：内容问题与构建问题在日志里天然分开，
+      # 且 fonts:subset 需要内容与配置都已就位。
+      - name: Materialize content and config
+        run: pnpm content:sync
+
+      # 本仓不启用番剧同步（用户 2026-09-27 明确不要）：CF 侧构建命令里也没有 anime:sync，
+      # 跳过它才能保证产物与 CF 基线逐项可比。
+      - name: Build site
+        run: pnpm build
+
+      - name: Collect build stats
+        run: |
+          set -euo pipefail
+          files=$(find dist -type f | wc -l | tr -d ' ')
+          pages=$(find dist -name 'index.html' | wc -l | tr -d ' ')
+          if [ -f dist/_redirects ]; then
+            redirects=$(awk 'NF && $1 !~ /^#/' dist/_redirects | wc -l | tr -d ' ')
+          else
+            redirects="(缺 dist/_redirects)"
+          fi
+          headers=$([ -f dist/_headers ] && echo yes || echo no)
+          fragments=$(find dist/pagefind -name '*.pf_fragment' 2>/dev/null | wc -l | tr -d ' ')
+          woff2=$(find dist -name '*.woff2' | wc -l | tr -d ' ')
+          size=$(du -sh dist | cut -f1)
+          {
+            echo "### Shadow build 对账（Actions 本轮 vs CF 侧基线）"
+            echo ""
+            echo "| 指标 | 本轮 (Actions) | CF 侧基线（2026-09-27 11:41 部署） |"
+            echo "|---|---|---|"
+            echo "| dist 文件数 | ${files} | 811（CF 部署资产总数） |"
+            echo "| 生成的 index.html 数 | ${pages} | 159 |"
+            echo "| \`_redirects\` 规则数 | ${redirects} | 188 |"
+            echo "| \`_headers\` 存在 | ${headers} | — |"
+            echo "| pagefind 索引片 | ${fragments} | — |"
+            echo "| woff2 字体 | ${woff2} | 4 |"
+            echo "| dist 体积 | ${size} | — |"
+            echo "| 内容 commit | \`${{ steps.content.outputs.sha }}\` | \`396d3d3\`（当时 main） |"
+            echo ""
+            echo "关键路由抽查："
+            for p in index.html 404.html sitemap-0.xml rss.xml posts/mattpocock-workflow/index.html; do
+              if [ -f "dist/$p" ]; then echo "- ✓ /$p"; else echo "- ✗ /$p（缺失）"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dist artifact (compare only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          # 只传构建产物；绝不要加 .content-src / src/content（公开仓 artifact 人人可下）。
+          name: dist-${{ github.run_id }}
+          path: dist
+          retention-days: 1
+          if-no-files-found: error
