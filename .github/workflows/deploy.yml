@@ -4,10 +4,13 @@
 #   阶段 1（已完成，2026-09-27）：只构建 + 上传 artifact 供与 Cloudflare 侧产物对账，**不含任何部署步骤**。
 #           实测：job 2m27s；与 CF 同内容 commit（396d3d3）逐项一致——160 pages / pagefind 126 页 2 语言 /
 #           179 icons / 字体 4 个 643.3 KB / 物化 245 files。
-#   阶段 2（本文件当前形态）：末尾加 preview 直传（`--branch=variant-e-test`，**不打生产**），
-#           用来验 `_redirects` 在直传模式下真的生效（本项目没有 public/_headers，那项不作判据）。
-#   阶段 3：`--branch=main` 生产直传 + 内容仓改用 repository_dispatch 触发，
-#           并在 CF 侧关掉 Branch control 的自动生产构建（顺序：先关平台、再启直传）。
+#   阶段 2（已完成，2026-09-27）：preview 直传（`--branch=variant-e-test`，**不打生产**）。
+#           实测：preview 部署 `https://variant-e-test.shirone-5a9.pages.dev`；
+#           **直传模式下 `_redirects` 生效**（curl：`GET /posts/AMDvsCommonjs/` → 301 → `/posts/amd-vs-commonjs/`）。
+#   阶段 3（本文件当前形态）：**生产直传**（`--branch=main`）+ 接收内容仓的 repository_dispatch。
+#           平台侧前置（已完成，2026-09-27 经 API 复核）：production_deployments_enabled=false（关掉 CF
+#           自动生产构建）、preview_deployment_setting=none；production_branch=main；域名与 Deploy Hook 保留。
+#           ⚠️ 本 workflow 现在是**唯一的上线入口**（CF 不再自动构建），改动前先想清楚。
 #
 # 为什么放代码仓：官方 docs/content-separation/dual-repo-ci.md 的主路径就是
 # 「内容仓 push → 派发信号 → 代码仓 Actions 拉内容 → content:sync → pnpm build → 交付平台」，
@@ -21,7 +24,11 @@
 name: Deploy
 
 on:
-  # 阶段 1 只用手动触发：避免每次代码 push 都跑一遍（阶段 3 再加 repository_dispatch）。
+  # 内容仓 push（过了 trigger-build.yml 的 validate 闸门后）发来的派发信号，携带内容 SHA。
+  # 内容版本因此精确对齐：checkout 到该 SHA → 构建 → 直传。
+  repository_dispatch:
+    types: [content-updated]
+  # 手动触发；回滚时把 content_ref 填成旧的内容 SHA（官方模板同款用法）。
   workflow_dispatch:
     inputs:
       content_ref:
@@ -43,7 +50,7 @@ env:
 
 jobs:
   build:
-    name: Shadow build (no deploy)
+    name: Build and deploy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -56,12 +63,16 @@ jobs:
         id: target
         # 经 env 传递而不直接内插：client_payload / inputs 属外部输入，内插会形成 shell 注入面。
         env:
+          # client_payload 属外部输入：先经 env 传递再进 shell，避免把外部输入内插成 shell 注入面。
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
           INPUT_REF: ${{ github.event.inputs.content_ref }}
         run: |
           set -euo pipefail
-          ref="${INPUT_REF:-}"
+          ref="${PAYLOAD_SHA:-}"
+          [ -n "$ref" ] || ref="${INPUT_REF:-}"
           [ -n "$ref" ] || ref="main"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "content ref = $ref"
 
       - name: Checkout theme
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -136,12 +147,12 @@ jobs:
             echo ""
             echo "| 指标 | 本轮 (Actions) | CF 侧基线（2026-09-27 11:41 部署） |"
             echo "|---|---|---|"
-            echo "| dist 文件数 | ${files} | 811（CF 部署资产总数） |"
-            echo "| 生成的 index.html 数 | ${pages} | 159 |"
+            echo "| dist 文件数 | ${files} | 834（阶段 1/2 实测；CF 报的 811 是它自己的资产口径） |"
+            echo "| 生成的 index.html 数 | ${pages} | 159（CF 报 160 pages，其中含 404.html） |"
             echo "| \`_redirects\` 规则数 | ${redirects} | 188 |"
-            echo "| \`_headers\` 存在 | ${headers} | — |"
+            echo "| \`_headers\` 存在 | ${headers} | no（本项目没有 public/_headers） |"
             echo "| pagefind 索引片 | ${fragments} | — |"
-            echo "| woff2 字体 | ${woff2} | 4 |"
+            echo "| woff2 文件数（含图标字体） | ${woff2} | 23（fonts:check 报的「4 个自定义字体资产」是另一口径） |"
             echo "| dist 体积 | ${size} | — |"
             echo "| 内容 commit | \`${{ steps.content.outputs.sha }}\` | \`396d3d3\`（当时 main） |"
             echo ""
@@ -160,15 +171,14 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # ── 阶段 2：preview 直传（**不打生产**）──────────────────────────────────────
-      # 分支名取非 main → Cloudflare 落成 preview 部署，URL 形如
-      #   https://variant-e-test.shirone-5a9.pages.dev
-      # 阶段 3 才改成 --branch=main（生产），且必须「先关 CF 自动生产构建、再启直传」，
-      # 否则一次 push 会触发两次上线。
+      # ── 生产直传（阶段 3）────────────────────────────────────────────────────────
+      # --branch=main = Cloudflare 的 production 环境（即项目 production_branch）。
+      # 平台侧已关掉自动生产构建，所以这里是唯一的**上线**入口：
+      #   内容仓 push → validate 闸门 → repository_dispatch → 本 workflow → wrangler 直传。
       # 直传是官方《Use Direct Upload with continuous integration》那套做法：
       #   Account API Token 需 Cloudflare Pages: Edit，配合 CLOUDFLARE_ACCOUNT_ID 使用。
       # --commit-dirty=true：content:sync 会往工作区写物化文件，仓库必然是 dirty 的（预期行为）。
-      - name: Deploy preview to Cloudflare Pages (direct upload)
+      - name: Deploy to Cloudflare Pages (production, direct upload)
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -178,5 +188,5 @@ jobs:
           set -euo pipefail
           npx --yes "wrangler@${WRANGLER_VERSION}" pages deploy dist \
             --project-name=shirone \
-            --branch=variant-e-test \
+            --branch=main \
             --commit-dirty=true
